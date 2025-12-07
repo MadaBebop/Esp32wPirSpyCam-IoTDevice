@@ -38,14 +38,3 @@ Per compilare il codice, è necessario installare le seguenti librerie nell'IDE 
 | `"FirebaseESP32.h"` | SDK di Firebase (usato solo per configurazione, non per l'upload foto). | Cerca **`Firebase Extended`** |
 
 ---
-
-## Configurazione e Personalizzazione
-
-Prima del caricamento, devi **OBBLIGATORIAMENTE** aggiornare le seguenti costanti nel file `.ino` con i tuoi dati:
-
-### 1. Credenziali Wi-Fi
-
-```cpp
-// Credenziali della tua rete Wi-Fi
-#define WIFI_SSID "NOME_TUA_RETE"          
-#define WIFI_PASSWORD "TUA_PASSWORD"
