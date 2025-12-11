@@ -1,18 +1,19 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "sd_read_write.h" // Per le definizioni della SD
+
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
-#include <HTTPClient.h> 
+#include <HTTPClient.h>
 #include <FS.h>
 #include <SD_MMC.h>
 
 
-// --- 1. DEFINIZIONI MACRO E PIN ---
+// DEFINIZIONI MACRO E PIN
 #define CAMERA_MODEL_ESP32S3_EYE // Definisce il modello S3
 #include "camera_pins.h" 
 
-// --- 2. CREDENZIALI E VARIABILI GLOBALI ---
+// CREDENZIALI
 const char* ssid     = "IoT";
 const char* password = "12345678";
 
@@ -25,11 +26,11 @@ const char* upload_url = "https://uploadclip-sawm43vu7a-uc.a.run.app";
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
-// PIR Sensor (GPIO 13)
-const int PIR_PIN = 13; 
-int statoCorrentePIR = LOW; 
+// PIR Sensor
+const int PIR_PIN = 41; 
+// Led del pir
+const int LED_PIN = 42;
 
-// --- DICHIARAZIONI FORWARD (PROTOTIPI) ---
 void sdmmcInit(void);
 void startCameraServer(); 
 int readFileNum(fs::FS &fs, const char * dirname);
@@ -40,20 +41,22 @@ void inviaNotificaTelegram(String messaggio);
 void uploadVideo(String clipPrefix);
 
 
-// =======================================================
-// SETUP E LOOP PRINCIPALI
-// =======================================================
-
 void setup() {
   Serial.begin(115200); 
   Serial.println("Avvio del sistema IoT.");
-  
+
   // Impostazioni SSL per Telegram
   client.setInsecure(); 
 
   // Inizializzazione Hardware
   pinMode(PIR_PIN, INPUT); 
-  
+  pinMode(LED_PIN, OUTPUT);
+
+  // Lampeggiamento per segnalazione inizio programma
+  digitalWrite(LED_PIN, HIGH);
+  delay(2000);
+  digitalWrite(LED_PIN, LOW); // parte spento
+
   // Inizializzazione Camera e SD
   cameraInit(); 
   sdmmcInit(); 
@@ -71,32 +74,20 @@ void setup() {
 }
 
 void loop() {
-  // Logica PIR
-  int nuovoStato = digitalRead(PIR_PIN); 
+  delay(2000); 
 
-  if (nuovoStato == HIGH && statoCorrentePIR == LOW) {
-    Serial.println("========================================");
+  if (digitalRead(PIR_PIN) == HIGH) {
     Serial.println("MOVIMENTO RILEVATO. Avvio acquisizione e notifica.");
-    Serial.println("========================================");
     
+    digitalWrite(LED_PIN, HIGH);
     inviaNotificaTelegram("Allarme: Movimento rilevato dalla telecamera.");
-    registraVideo(5); 
-
-    statoCorrentePIR = HIGH; 
-    delay(10000); 
-
-  } else if (nuovoStato == LOW && statoCorrentePIR == HIGH) {
-    statoCorrentePIR = LOW;
+    registraVideo(2); 
+    digitalWrite(LED_PIN, LOW);
   }
-  
-  delay(100); 
+
+  // uso i delay per non effettuare troppi loop velocemente
+  delay(1000); 
 }
-
-// =======================================================
-// IMPLEMENTAZIONE FUNZIONI AGGIUNTE
-// =======================================================
-
-// --- FUNZIONE CAMERA INIT ---
 
 void cameraInit(void) {
     camera_config_t config;
@@ -134,8 +125,7 @@ void cameraInit(void) {
 }
 
 
-// --- TELEGRAM ---
-
+// Telegram
 void inviaNotificaTelegram(String messaggio) {
   if (WiFi.status() == WL_CONNECTED) {
     if (bot.sendMessage(CHAT_ID, messaggio, "")) {
@@ -148,8 +138,7 @@ void inviaNotificaTelegram(String messaggio) {
   }
 }
 
-// --- REGISTRAZIONE VIDEO ---
-
+// Reg video
 void registraVideo(int durataSecondi) {
     const int FPS = 5; 
     const int DELAY_MS = 1000 / FPS; 
@@ -191,11 +180,11 @@ void registraVideo(int durataSecondi) {
     }
 
     Serial.printf("Registrazione terminata. Clip %d salvata in: %s\n", clipNum + 1, clipPrefix.c_str());
-    
-    uploadVideo(clipPrefix); 
-}
 
-// --- CARICAMENTO HTTP POST (Ripristinato con Stream*) ---
+    
+    uploadVideo(clipPrefix);
+    
+}
 
 void uploadVideo(String clipPath) { 
   if (WiFi.status() != WL_CONNECTED) {
@@ -211,37 +200,47 @@ void uploadVideo(String clipPath) {
     return;
   }
 
+  // Creiamo un client sicuro dedicato SOLO all'upload
+  WiFiClientSecure uploadClient;
+  uploadClient.setInsecure(); // Ignora verifica certificato (più veloce e meno memoria)
+
   File file = root.openNextFile();
   while (file) {
     if (!file.isDirectory()) {
       size_t fileSize = file.size();
-      Serial.printf("Tentativo di upload del file: %s (%u bytes)\n", file.name(), fileSize);
-
-      // 1. Apri la connessione HTTP
+      Serial.printf("Tentativo di upload del file: %s (%u bytes)... ", file.name(), fileSize);
+      
+      // Inizializziamo HTTPClient passando il client sicuro
       HTTPClient http;
-      http.begin(upload_url); 
       
-      // 2. Impostazioni Header
-      http.addHeader("Content-Type", "application/octet-stream");
-      http.addHeader("X-File-Name", file.name()); 
-      
-      // 3. CHIAMATA A sendRequest con Stream*: 
-      // Si presume che la versione 2.0.5 del core ESP32 gestisca correttamente l'ereditarietà di fs::File da Stream.
-      // Usiamo il casting esplicito come misura precauzionale.
-      int httpResponseCode = http.sendRequest("POST", (Stream*)&file, fileSize); 
+      // Aumentiamo il timeout (importante per file video o connessioni lente)
+      http.setTimeout(10000); 
 
-      if (httpResponseCode > 0) {
-        Serial.printf("Upload file %s riuscito. Codice HTTP: %d\n", file.name(), httpResponseCode);
+      if (http.begin(uploadClient, upload_url)) { // Usa il client creato sopra
         
-      } else {
-        Serial.printf("Upload file %s fallito. Codice errore: %d - %s\n", 
-                      file.name(), 
-                      httpResponseCode, 
-                      http.errorToString(httpResponseCode).c_str());
-      }
+        http.addHeader("Content-Type", "application/octet-stream");
+        http.addHeader("X-File-Name", file.name());
+        
+        // Forza la chiusura della connessione dopo ogni richiesta per liberare il socket
+        http.addHeader("Connection", "close"); 
 
-      http.end();
-      // Nota: Non c'è bisogno di free(fileBuffer) qui!
+        int httpResponseCode = http.sendRequest("POST", (Stream*)&file, fileSize);
+
+        if (httpResponseCode > 0) {
+          Serial.printf("OK! (Code: %d)\n", httpResponseCode);
+        } else {
+          Serial.printf("FALLITO! (Err: %s)\n", http.errorToString(httpResponseCode).c_str());
+        }
+        
+        // Chiudiamo tutto esplicitamente
+        http.end();
+      } else {
+        Serial.println("Impossibile connettersi al server.");
+      }
+      
+      // IMPORTANTE: Delay per permettere al socket di chiudersi e alla RAM di stabilizzarsi
+      uploadClient.stop(); // Forza chiusura socket TCP
+      delay(500); 
     }
     file = root.openNextFile();
   }
