@@ -1,19 +1,18 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "sd_read_write.h" // Per le definizioni della SD
-
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
-#include <HTTPClient.h>
+#include <HTTPClient.h> 
 #include <FS.h>
 #include <SD_MMC.h>
 
 
-// DEFINIZIONI MACRO E PIN
+/* macro e pin */
 #define CAMERA_MODEL_ESP32S3_EYE // Definisce il modello S3
 #include "camera_pins.h" 
 
-// CREDENZIALI
+// Auth wifi
 const char* ssid     = "IoT";
 const char* password = "12345678";
 
@@ -27,10 +26,13 @@ WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
 // PIR Sensor
-const int PIR_PIN = 41; 
-// Led del pir
-const int LED_PIN = 42;
+const int PIR_PIN = 13; 
+int statoCorrentePIR = LOW; 
 
+// LED di stato
+const int LED_PIN = 42; 
+
+// pre dichiarazioni
 void sdmmcInit(void);
 void startCameraServer(); 
 int readFileNum(fs::FS &fs, const char * dirname);
@@ -42,8 +44,10 @@ void uploadVideo(String clipPrefix);
 
 
 void setup() {
-  Serial.begin(115200); 
-  Serial.println("Avvio del sistema IoT.");
+  // Aggiungere un piccolo delay per l'inizializzazione della seriale USB
+  delay(2000); 
+  Serial.begin(115200); // bauds
+  Serial.println("----- Avvio del sistema IoT -----");
 
   // Impostazioni SSL per Telegram
   client.setInsecure(); 
@@ -51,14 +55,14 @@ void setup() {
   // Inizializzazione Hardware
   pinMode(PIR_PIN, INPUT); 
   pinMode(LED_PIN, OUTPUT);
-
+  
   // Lampeggiamento per segnalazione inizio programma
   digitalWrite(LED_PIN, HIGH);
-  delay(2000);
+  delay(500); // Ridotto il lampeggio per non bloccare il setup
   digitalWrite(LED_PIN, LOW); // parte spento
 
   // Inizializzazione Camera e SD
-  cameraInit(); 
+  cameraInit();
   sdmmcInit(); 
   
   // Connessione Wi-Fi
@@ -74,19 +78,29 @@ void setup() {
 }
 
 void loop() {
-  delay(2000); 
+  delay(100); // Piccolo ritardo anti-rumore
+  
+  // Logica PIR
+  int nuovoStato = digitalRead(PIR_PIN);
 
-  if (digitalRead(PIR_PIN) == HIGH) {
+  Serial.println("------- IN ALLERTA -------");
+  
+  // Messo doppio controllo per evitare di avere continue attivazioni veloci in sequenza
+  if (nuovoStato == HIGH && statoCorrentePIR == LOW) {
     Serial.println("MOVIMENTO RILEVATO. Avvio acquisizione e notifica.");
     
     digitalWrite(LED_PIN, HIGH);
+
     inviaNotificaTelegram("Allarme: Movimento rilevato dalla telecamera.");
     registraVideo(2); 
-    digitalWrite(LED_PIN, LOW);
-  }
 
-  // uso i delay per non effettuare troppi loop velocemente
-  delay(1000); 
+    digitalWrite(LED_PIN, LOW);
+
+    statoCorrentePIR = HIGH; 
+    delay(50000); // Pausa di 5 secondi dopo il rilevamento
+  } else if (nuovoStato == LOW && statoCorrentePIR == HIGH) {
+    statoCorrentePIR = LOW;
+  }
 }
 
 void cameraInit(void) {
@@ -124,8 +138,6 @@ void cameraInit(void) {
     Serial.println("Camera inizializzata con successo.");
 }
 
-
-// Telegram
 void inviaNotificaTelegram(String messaggio) {
   if (WiFi.status() == WL_CONNECTED) {
     if (bot.sendMessage(CHAT_ID, messaggio, "")) {
@@ -138,27 +150,23 @@ void inviaNotificaTelegram(String messaggio) {
   }
 }
 
-// Reg video
 void registraVideo(int durataSecondi) {
-    const int FPS = 5; 
+    const int FPS = 5;
     const int DELAY_MS = 1000 / FPS; 
     const int NUM_FRAMES = (durataSecondi * 1000) / DELAY_MS;
-    
     Serial.printf("Inizio registrazione: %d frame obiettivo.\n", NUM_FRAMES);
 
     String videoDir = "/video";
-    int clipNum = readFileNum(SD_MMC, videoDir.c_str()); 
-    String clipPrefix = videoDir + "/clip_" + String(clipNum + 1); 
-    
+    int clipNum = readFileNum(SD_MMC, videoDir.c_str());
+    String clipPrefix = videoDir + "/clip_" + String(clipNum + 1);
     if (clipNum < 0) {
       Serial.println("Registrazione annullata: Errore SD.");
       return;
     }
 
     SD_MMC.mkdir(clipPrefix.c_str());
-    
     for (int i = 0; i < NUM_FRAMES; i++) {
-        uint32_t start_time = millis(); 
+        uint32_t start_time = millis();
         camera_fb_t * fb = esp_camera_fb_get();
 
         if (!fb) {
@@ -180,10 +188,8 @@ void registraVideo(int durataSecondi) {
     }
 
     Serial.printf("Registrazione terminata. Clip %d salvata in: %s\n", clipNum + 1, clipPrefix.c_str());
-
     
     uploadVideo(clipPrefix);
-    
 }
 
 void uploadVideo(String clipPath) { 
@@ -200,47 +206,45 @@ void uploadVideo(String clipPath) {
     return;
   }
 
-  // Creiamo un client sicuro dedicato SOLO all'upload
+  // Crea un client sicuro dedicato SOLO all'upload per isolare le risorse.
   WiFiClientSecure uploadClient;
-  uploadClient.setInsecure(); // Ignora verifica certificato (più veloce e meno memoria)
-
+  uploadClient.setInsecure(); // Ignora verifica certificato (più veloce)
+  
   File file = root.openNextFile();
   while (file) {
     if (!file.isDirectory()) {
       size_t fileSize = file.size();
       Serial.printf("Tentativo di upload del file: %s (%u bytes)... ", file.name(), fileSize);
       
-      // Inizializziamo HTTPClient passando il client sicuro
       HTTPClient http;
-      
-      // Aumentiamo il timeout (importante per file video o connessioni lente)
-      http.setTimeout(10000); 
+      http.setTimeout(5000); // Aumenta il timeout per upload più lunghi
 
-      if (http.begin(uploadClient, upload_url)) { // Usa il client creato sopra
+      // Usa il client dedicato e controlla l'inizio della connessione
+      if (http.begin(uploadClient, upload_url)) { 
         
         http.addHeader("Content-Type", "application/octet-stream");
         http.addHeader("X-File-Name", file.name());
-        
-        // Forza la chiusura della connessione dopo ogni richiesta per liberare il socket
-        http.addHeader("Connection", "close"); 
+        http.addHeader("Connection", "close"); // Forza la chiusura del socket
 
         int httpResponseCode = http.sendRequest("POST", (Stream*)&file, fileSize);
 
         if (httpResponseCode > 0) {
           Serial.printf("OK! (Code: %d)\n", httpResponseCode);
+          // Opzionale: Se l'upload ha successo, elimina il file
+          SD_MMC.remove(file.name()); 
         } else {
           Serial.printf("FALLITO! (Err: %s)\n", http.errorToString(httpResponseCode).c_str());
         }
         
-        // Chiudiamo tutto esplicitamente
         http.end();
       } else {
-        Serial.println("Impossibile connettersi al server.");
+        Serial.println("Impossibile avviare la connessione HTTP.");
       }
       
-      // IMPORTANTE: Delay per permettere al socket di chiudersi e alla RAM di stabilizzarsi
-      uploadClient.stop(); // Forza chiusura socket TCP
-      delay(500); 
+      // Queste tre istruzioni fixano il problema di chiamate consecutive :)
+      file.close(); // Chiude esplicitamente il file handle della SD
+      uploadClient.stop(); // CRUCIALE: Forza la chiusura del socket TCP/SSL
+      delay(1000); // CRUCIALE: Ritardo di 1.5 secondi per pulizia risorse
     }
     file = root.openNextFile();
   }
