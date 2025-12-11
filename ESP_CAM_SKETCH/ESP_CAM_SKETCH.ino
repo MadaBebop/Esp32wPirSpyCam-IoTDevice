@@ -26,11 +26,11 @@ WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
 // PIR Sensor
-const int PIR_PIN = 13; 
+const int PIR_PIN = 48; 
 int statoCorrentePIR = LOW; 
 
 // LED di stato
-const int LED_PIN = 42; 
+const int LED_PIN = 2; 
 
 // pre dichiarazioni
 void sdmmcInit(void);
@@ -96,11 +96,11 @@ void loop() {
 
     digitalWrite(LED_PIN, LOW);
 
-    statoCorrentePIR = HIGH; 
-    delay(50000); // Pausa di 5 secondi dopo il rilevamento
+    statoCorrentePIR = HIGH;
   } else if (nuovoStato == LOW && statoCorrentePIR == HIGH) {
     statoCorrentePIR = LOW;
   }
+  delay(1000);
 }
 
 void cameraInit(void) {
