@@ -1,121 +1,163 @@
 #include "esp_camera.h"
 #include <WiFi.h>
-#include "sd_read_write.h"  // Include le funzioni per la gestione della SD (scrivere file, contare clip)
+#include "sd_read_write.h"
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
 #include <HTTPClient.h>
 #include <FS.h>
 #include <SD_MMC.h>
-
+#include <ArduinoJson.h>
 
 /* Definizione di macro e pin */
-#define CAMERA_MODEL_ESP32S3_EYE  // Definisce il modello della scheda ESP32-S3-EYE
+#define CAMERA_MODEL_ESP32S3_EYE 
 #include "camera_pins.h" 
-
 
 // Credenziali WiFi
 const char* ssid = "IoT";
-const char* password = "12345678";
+const char* password = "12345678"; 
 
 // Parametri Telegram
-#define BOT_TOKEN "8411404633:AAGXPceyNAIZ2f1lML9TqELSfN-GdQBLVkQ"
+#define BOT_TOKEN "8411404633:AAHo7E2HYmXMZ1zFKi_PcixgQxfht7nizRQ"
 #define CHAT_ID "6333700308"
 
-// URL dell'endpoint Cloud Run (Firebase) per l'upload dei frame
-const char* upload_url = "https://uploadclip-sawm43vu7a-uc.a.run.app"; 
+// URL dell'endpoint Cloud Run
+const char* upload_url = "https://uploadclip-sawm43vu7a-uc.a.run.app";
 
-// Oggetti client e bot per la comunicazione sicura
+// Oggetti client e bot
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
-// Pin del sensore PIR e variabile di stato
-const int PIR_PIN = 48; // Pin corretto per il PIR
-int statoCorrentePIR = LOW; // Stato attuale del sensore
+// Pin
+const int PIR_PIN = 48;
+const int LED_PIN = 2; // LED di stato
 
-// Pin del LED di stato
-const int LED_PIN = 2; 
+// Variabili di stato e gestione tempi
+int statoCorrentePIR = LOW; 
+unsigned long lastTrigger = 0;          
+const unsigned long pirCooldown = 50000; 
+unsigned long lastTimeBotRan = 0;       
+const int botRequestDelay = 1000;       
 
+// --- VARIABILI GLOBALI PER CALLBACK TELEGRAM ---
+uint8_t* current_fb_buf = nullptr;
+size_t current_fb_len = 0;
+size_t current_fb_idx = 0;
 
-// Prototipi delle funzioni
+// Prototipi
 void sdmmcInit(void);
-void startCameraServer();
-int readFileNum(fs::FS& fs, const char* dirname);
-void writejpg(fs::FS& fs, const char* path, const uint8_t* buf, size_t size);
 void cameraInit(void);
 void registraVideo(int durataSecondi);
-void inviaNotificaTelegram(String messaggio); // Funzione che in questa fase invia solo testo
+void inviaNotificaTelegram(String messaggio);
 void uploadVideo(String clipPrefix);
+void handleNewMessages(int numNewMessages);
+String sendPhotoTelegram();
 
+// Funzioni Callback per l'invio binario
+bool isMoreDataAvailable() {
+  return (current_fb_idx < current_fb_len);
+}
+
+byte getNextByte() {
+  if (current_fb_idx < current_fb_len) {
+    return current_fb_buf[current_fb_idx++];
+  }
+  return 0;
+}
 
 void setup() {
-  delay(2000); // Ritardo iniziale per la stabilizzazione seriale
-  Serial.begin(115200); // Inizializzazione della comunicazione seriale
-  Serial.println("----- Avvio del sistema IoT -----");
+  Serial.begin(115200);
+  client.setInsecure();
 
-  // Impostazioni SSL: disabilita la verifica del certificato per maggiore compatibilità
-  client.setInsecure(); 
-
-  // Inizializzazione Hardware
-  // Nota: ho corretto il pin per stabilità, usa INPUT_PULLDOWN se necessario, altrimenti INPUT
-  pinMode(PIR_PIN, INPUT_PULLDOWN); 
+  pinMode(PIR_PIN, INPUT_PULLDOWN);
   pinMode(LED_PIN, OUTPUT);
 
-  // Lampeggiamento LED per segnalare l'inizio
-  digitalWrite(LED_PIN, HIGH);
-  delay(500); 
-  digitalWrite(LED_PIN, LOW); 
-
-  // Inizializzazione Camera e SD
   cameraInit();
   sdmmcInit(); 
 
-  // Connessione Wi-Fi
-  Serial.print("Connessione a WiFi");
   WiFi.begin(ssid, password);
-
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println("\nWiFi connesso.");
-  Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+  
+  inviaNotificaTelegram("🤖 Sistema Online!\nUsa /foto per scattare o /stato per info.");
 }
 
-
 void loop() {
-  delay(100); // Piccolo ritardo per cicli stabili
+  unsigned long currentMillis = millis();
 
-  // Logica PIR: legge lo stato del sensore
+  // 1. GESTIONE TELEGRAM
+  if (currentMillis - lastTimeBotRan > botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages) {
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastTimeBotRan = currentMillis;
+  }
+
+  // 2. GESTIONE PIR
   int nuovoStato = digitalRead(PIR_PIN);
-
-  Serial.println("------- IN ALLERTA -------");
-
-  // Rilevamento di movimento: si attiva solo se c'è una transizione LOW -> HIGH
   if (nuovoStato == HIGH && statoCorrentePIR == LOW) {
-    Serial.println("MOVIMENTO RILEVATO. Avvio acquisizione e notifica.");
-
-    digitalWrite(LED_PIN, HIGH); // Accende il LED
-
-    // 1. Invia la notifica di solo testo a Telegram
-    inviaNotificaTelegram("Allarme: Movimento rilevato dalla telecamera.");
-
-    // 2. Registra i frame sulla SD e, al termine, avvia l'upload su Cloud Run
-    registraVideo(2); // Registra per 2 secondi
-
-    digitalWrite(LED_PIN, LOW); // Spegne il LED
-
-    statoCorrentePIR = HIGH; // Imposta lo stato a HIGH per ignorare i trigger successivi
-    delay(50000); // Ritardo di 50 secondi per non riattivare subito (debouncing hardware/logico)
-
+    if (currentMillis - lastTrigger > pirCooldown) {
+      Serial.println("Movimento!");
+      digitalWrite(LED_PIN, HIGH);
+      inviaNotificaTelegram("⚠️ Allarme: Movimento rilevato!");
+      registraVideo(2);
+      digitalWrite(LED_PIN, LOW);
+      lastTrigger = millis();
+      statoCorrentePIR = HIGH; 
+    }
   } else if (nuovoStato == LOW && statoCorrentePIR == HIGH) {
-    // Reset dello stato PIR per poter rilevare il prossimo movimento
     statoCorrentePIR = LOW;
   }
 }
 
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    if (chat_id != CHAT_ID) {
+      bot.sendMessage(chat_id, "Accesso negato.", "");
+      continue;
+    }
 
-void cameraInit(void) {
-  // Configurazione dei parametri della telecamera (pin, risoluzione, formati)
+    String text = bot.messages[i].text;
+    if (text == "/start") {
+      String welcome = "Comandi:\n/foto - Scatta foto\n/stato - Stato sistema";
+      bot.sendMessage(chat_id, welcome, "");
+    } 
+    else if (text == "/foto") {
+      bot.sendMessage(chat_id, "Scatto in corso...", "");
+      sendPhotoTelegram();
+    } 
+    else if (text == "/stato") {
+      String info = "📊 STATO\nWiFi: " + String(WiFi.RSSI()) + "dBm\n";
+      info += "PIR: " + String(digitalRead(PIR_PIN) == HIGH ? "ATTIVO" : "OK") + "\n";
+      bot.sendMessage(chat_id, info, "");
+    }
+  }
+}
+
+String sendPhotoTelegram() {
+  camera_fb_t * fb = esp_camera_fb_get(); // Svuota buffer
+  esp_camera_fb_return(fb); 
+  fb = esp_camera_fb_get(); // Foto vera
+  
+  if (!fb) return "Camera fail";
+
+  current_fb_buf = fb->buf;
+  current_fb_len = fb->len;
+  current_fb_idx = 0;
+
+  String sent = bot.sendPhotoByBinary(CHAT_ID, "image/jpeg", fb->len,
+                                      isMoreDataAvailable, getNextByte, nullptr, nullptr);
+  
+  esp_camera_fb_return(fb);
+  return sent ? "OK" : "Error";
+}
+
+void cameraInit() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -127,157 +169,57 @@ void cameraInit(void) {
   config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
   config.pin_sccb_sda = SIOD_GPIO_NUM; config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
-
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_VGA;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
+  config.jpeg_quality = 10;
+  config.fb_count = 2;
 
-  // Usa PSRAM per buffer più grandi se disponibile
-  if (psramFound()) {
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;
-  }
-
-  // Inizializza la fotocamera
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Errore inizializzazione Camera 0x%x\n", err);
-    return;
-  }
-  Serial.println("Camera inizializzata con successo.");
+  if (esp_camera_init(&config) != ESP_OK) Serial.println("Camera Error");
 }
 
-
-// Funzione per inviare notifiche di solo testo a Telegram
 void inviaNotificaTelegram(String messaggio) {
-  if (WiFi.status() == WL_CONNECTED) {
-    if (bot.sendMessage(CHAT_ID, messaggio, "")) {
-      Serial.println("Notifica Telegram inviata.");
-    } else {
-      Serial.println("Errore nell'invio della notifica Telegram.");
-    }
-  } else {
-    Serial.println("WiFi disconnesso, notifica Telegram annullata.");
-  }
+  bot.sendMessage(CHAT_ID, messaggio, "");
 }
 
-
-void registraVideo(int durataSecondi) {
-  const int FPS = 5;
-  const int DELAY_MS = 1000 / FPS;
-  const int NUM_FRAMES = (durataSecondi * 1000) / DELAY_MS;
-  Serial.printf("Inizio registrazione: %d frame obiettivo.\n", NUM_FRAMES);
-
-  // Logica per determinare la cartella della clip successiva (es. /video/clip_1)
+void registraVideo(int durata) {
   String videoDir = "/video";
   int clipNum = readFileNum(SD_MMC, videoDir.c_str());
   String clipPrefix = videoDir + "/clip_" + String(clipNum + 1);
-  if (clipNum < 0) {
-    Serial.println("Registrazione annullata: Errore SD.");
-    return;
-  }
-
   SD_MMC.mkdir(clipPrefix.c_str());
-  for (int i = 0; i < NUM_FRAMES; i++) {
-    uint32_t start_time = millis();
-    
-    // Acquisisce il frame dalla telecamera
+  
+  for (int i = 0; i < (durata * 5); i++) {
     camera_fb_t* fb = esp_camera_fb_get();
-
-    if (!fb) {
-      Serial.println("Cattura frame fallita. Salto.");
-      continue;
+    if (fb) {
+      char path[64];
+      sprintf(path, "%s/f_%03d.jpg", clipPrefix.c_str(), i);
+      writejpg(SD_MMC, path, fb->buf, fb->len);
+      esp_camera_fb_return(fb);
     }
-
-    // Costruisce il percorso del file (es. /video/clip_1/frame_000.jpg)
-    char framePath[64];
-    sprintf(framePath, "%s/frame_%03d.jpg", clipPrefix.c_str(), i);
-
-    // Scrive il buffer del frame sulla SD
-    writejpg(SD_MMC, framePath, fb->buf, fb->len);
-
-    // Rilascia il buffer per la memoria
-    esp_camera_fb_return(fb);
-
-    // Calcola il ritardo necessario per mantenere il frame rate (FPS)
-    uint32_t elapsed_time = millis() - start_time;
-    if (elapsed_time < DELAY_MS) {
-      delay(DELAY_MS - elapsed_time);
-    }
+    delay(200);
   }
-
-  Serial.printf("Registrazione terminata. Clip %d salvata in: %s\n", clipNum + 1, clipPrefix.c_str());
-
-  // Avvia l'upload di tutti i frame della clip
   uploadVideo(clipPrefix);
 }
 
-
 void uploadVideo(String clipPath) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Upload annullato: WiFi disconnesso.");
-    return;
-  }
-
-  Serial.printf("Inizio upload dei file da cartella: %s\n", clipPath.c_str());
-
-  // Apre la directory contenente i frame
   File root = SD_MMC.open(clipPath.c_str());
-  if (!root || !root.isDirectory()) {
-    Serial.println("Errore: Impossibile aprire la directory clip per upload.");
-    return;
-  }
-
-  // Crea un client sicuro dedicato per isolare le risorse di rete
-  WiFiClientSecure uploadClient;
-  uploadClient.setInsecure(); 
-
-  // Inizia a iterare sui file della clip
+  if (!root) return;
+  
   File file = root.openNextFile();
   while (file) {
     if (!file.isDirectory()) {
-      size_t fileSize = file.size();
-      Serial.printf("Tentativo di upload del file: %s (%u bytes)... ", file.name(), fileSize);
-
       HTTPClient http;
-      http.setTimeout(5000); // Timeout per l'operazione
-
-      // Inizia la connessione HTTP
-      if (http.begin(uploadClient, upload_url)) { 
-
-        // Imposta gli header richiesti dal server Cloud Run
+      WiFiClientSecure upClient; upClient.setInsecure();
+      if (http.begin(upClient, upload_url)) {
         http.addHeader("Content-Type", "application/octet-stream");
         http.addHeader("X-File-Name", file.name());
-        http.addHeader("Connection", "close"); // Forza la chiusura del socket
-
-        // Invia il file usando il file handle (Stream*) e la dimensione
-        int httpResponseCode = http.sendRequest("POST", (Stream*)&file, fileSize);
-
-        if (httpResponseCode > 0) {
-          Serial.printf("OK! (Code: %d)\n", httpResponseCode);
-          // Elimina il file dopo l'upload riuscito
-          SD_MMC.remove(file.name());
-        } else {
-          Serial.printf("FALLITO! (Err: %s)\n", http.errorToString(httpResponseCode).c_str());
-        }
-
-        http.end(); // Chiude la transazione HTTP
-
-      } else {
-        Serial.println("Impossibile avviare la connessione HTTP.");
+        int res = http.sendRequest("POST", (Stream*)&file, file.size());
+        if (res > 0) SD_MMC.remove(file.name());
+        http.end();
       }
-
-      file.close(); // Chiude esplicitamente il file handle della SD
-      uploadClient.stop(); // Chiude forzatamente il socket TCP/SSL
-      delay(1000); // Ritardo per pulizia risorse
     }
-    file = root.openNextFile(); // Passa al prossimo file
+    file = root.openNextFile();
   }
-
-  Serial.println("Upload della clip completato.");
 }
