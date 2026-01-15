@@ -8,65 +8,54 @@
 #include <SD_MMC.h>
 #include <ArduinoJson.h>
 
-/* Definizione di macro e pin */
+/* Configurazione Hardware */
 #define CAMERA_MODEL_ESP32S3_EYE 
 #include "camera_pins.h" 
 
-// Credenziali WiFi
+// Credenziali - MODIFICA SE NECESSARIO
 const char* ssid = "IoT";
 const char* password = "12345678"; 
 
-// Parametri Telegram
 #define BOT_TOKEN "8411404633:AAHo7E2HYmXMZ1zFKi_PcixgQxfht7nizRQ"
 #define CHAT_ID "6333700308"
-
-// URL dell'endpoint Cloud Run
 const char* upload_url = "https://uploadclip-sawm43vu7a-uc.a.run.app";
 
-// Oggetti client e bot
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
-// Pin
 const int PIR_PIN = 48;
-const int LED_PIN = 2; // LED di stato
+const int LED_PIN = 2;
 
-// Variabili di stato e gestione tempi
-int statoCorrentePIR = LOW; 
+// Gestione Tempi
 unsigned long lastTrigger = 0;          
 const unsigned long pirCooldown = 50000; 
 unsigned long lastTimeBotRan = 0;       
-const int botRequestDelay = 1000;       
+int botRequestDelay = 500; 
 
-// --- VARIABILI GLOBALI PER CALLBACK TELEGRAM ---
-uint8_t* current_fb_buf = nullptr;
-size_t current_fb_len = 0;
-size_t current_fb_idx = 0;
+// --- VARIABILI E FUNZIONI PER CALLBACK TELEGRAM (DA SD) ---
+File currentFile; 
 
-// Prototipi
-void sdmmcInit(void);
-void cameraInit(void);
-void registraVideo(int durataSecondi);
-void inviaNotificaTelegram(String messaggio);
-void uploadVideo(String clipPrefix);
-void handleNewMessages(int numNewMessages);
-String sendPhotoTelegram();
-
-// Funzioni Callback per l'invio binario
 bool isMoreDataAvailable() {
-  return (current_fb_idx < current_fb_len);
+  return currentFile.available();
 }
 
 byte getNextByte() {
-  if (current_fb_idx < current_fb_len) {
-    return current_fb_buf[current_fb_idx++];
-  }
-  return 0;
+  return currentFile.read();
 }
 
+// Prototipi
+void cameraInit();
+void registraVideo(int durata);
+void uploadVideo(String clipPath);
+void handleNewMessages(int numNewMessages);
+String sendPhotoTelegram();
+
 void setup() {
+  setCpuFrequencyMhz(240); // Massima velocità per SSL
   Serial.begin(115200);
+  
   client.setInsecure();
+  client.setHandshakeTimeout(120000);
 
   pinMode(PIR_PIN, INPUT_PULLDOWN);
   pinMode(LED_PIN, OUTPUT);
@@ -79,15 +68,16 @@ void setup() {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connesso.");
+  WiFi.setSleep(false); // Disabilita risparmio energetico WiFi per reattività
+  Serial.println("\nConnesso!");
   
-  inviaNotificaTelegram("🤖 Sistema Online!\nUsa /foto per scattare o /stato per info.");
+  bot.sendMessage(CHAT_ID, "🤖 Sistema Online!\nUsa /foto per scattare o /stato per info.", "");
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  // 1. GESTIONE TELEGRAM
+  // 1. Controllo messaggi Telegram
   if (currentMillis - lastTimeBotRan > botRequestDelay) {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
     while (numNewMessages) {
@@ -97,63 +87,75 @@ void loop() {
     lastTimeBotRan = currentMillis;
   }
 
-  // 2. GESTIONE PIR
-  int nuovoStato = digitalRead(PIR_PIN);
-  if (nuovoStato == HIGH && statoCorrentePIR == LOW) {
+  // 2. Allarme PIR
+  if (digitalRead(PIR_PIN) == HIGH) {
     if (currentMillis - lastTrigger > pirCooldown) {
-      Serial.println("Movimento!");
       digitalWrite(LED_PIN, HIGH);
-      inviaNotificaTelegram("⚠️ Allarme: Movimento rilevato!");
+      bot.sendMessage(CHAT_ID, "⚠️ Allarme: Movimento rilevato!", "");
       registraVideo(2);
       digitalWrite(LED_PIN, LOW);
       lastTrigger = millis();
-      statoCorrentePIR = HIGH; 
     }
-  } else if (nuovoStato == LOW && statoCorrentePIR == HIGH) {
-    statoCorrentePIR = LOW;
   }
 }
 
 void handleNewMessages(int numNewMessages) {
   for (int i = 0; i < numNewMessages; i++) {
-    String chat_id = String(bot.messages[i].chat_id);
-    if (chat_id != CHAT_ID) {
-      bot.sendMessage(chat_id, "Accesso negato.", "");
-      continue;
-    }
-
     String text = bot.messages[i].text;
-    if (text == "/start") {
-      String welcome = "Comandi:\n/foto - Scatta foto\n/stato - Stato sistema";
-      bot.sendMessage(chat_id, welcome, "");
-    } 
-    else if (text == "/foto") {
-      bot.sendMessage(chat_id, "Scatto in corso...", "");
+    String chat_id = bot.messages[i].chat_id;
+
+    if (chat_id != CHAT_ID) continue;
+
+    if (text == "/foto") {
+      bot.sendMessage(chat_id, "📸 Scatto e invio in corso...", "");
       sendPhotoTelegram();
     } 
     else if (text == "/stato") {
-      String info = "📊 STATO\nWiFi: " + String(WiFi.RSSI()) + "dBm\n";
-      info += "PIR: " + String(digitalRead(PIR_PIN) == HIGH ? "ATTIVO" : "OK") + "\n";
-      bot.sendMessage(chat_id, info, "");
+      String st = "📶 WiFi: " + String(WiFi.RSSI()) + "dBm\n";
+      st += "⏲️ Ultimo allarme: " + String((millis() - lastTrigger) / 1000) + "s fa";
+      bot.sendMessage(chat_id, st, "");
+    }
+    else if (text == "/start") {
+      bot.sendMessage(chat_id, "Comandi:\n/foto - Istantanea\n/stato - Diagnostica", "");
     }
   }
 }
 
 String sendPhotoTelegram() {
-  camera_fb_t * fb = esp_camera_fb_get(); // Svuota buffer
-  esp_camera_fb_return(fb); 
-  fb = esp_camera_fb_get(); // Foto vera
+  Serial.println("--- Procedura Foto ---");
   
+  // Svuota buffer camera
+  camera_fb_t * fb = esp_camera_fb_get();
+  esp_camera_fb_return(fb); 
+  
+  fb = esp_camera_fb_get();
   if (!fb) return "Camera fail";
 
-  current_fb_buf = fb->buf;
-  current_fb_len = fb->len;
-  current_fb_idx = 0;
-
-  String sent = bot.sendPhotoByBinary(CHAT_ID, "image/jpeg", fb->len,
-                                      isMoreDataAvailable, getNextByte, nullptr, nullptr);
-  
+  // Salvataggio temporaneo su SD per stabilità SSL
+  const char* path = "/bot_temp.jpg";
+  File tempFile = SD_MMC.open(path, FILE_WRITE);
+  if (!tempFile) {
+    esp_camera_fb_return(fb);
+    return "SD Fail";
+  }
+  tempFile.write(fb->buf, fb->len);
+  unsigned int fSize = fb->len;
+  tempFile.close();
   esp_camera_fb_return(fb);
+
+  // Invio a Telegram
+  currentFile = SD_MMC.open(path, FILE_READ);
+  if (!currentFile) return "Read Fail";
+
+  bool sent = bot.sendPhotoByBinary(CHAT_ID, "image/jpeg", fSize,
+                                    isMoreDataAvailable, getNextByte, nullptr, nullptr);
+  
+  currentFile.close();
+  SD_MMC.remove(path);
+
+  if (sent) Serial.println("Foto inviata!");
+  else Serial.println("Errore invio.");
+  
   return sent ? "OK" : "Error";
 }
 
@@ -174,14 +176,10 @@ void cameraInit() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 10;
+  config.jpeg_quality = 12;
   config.fb_count = 2;
 
   if (esp_camera_init(&config) != ESP_OK) Serial.println("Camera Error");
-}
-
-void inviaNotificaTelegram(String messaggio) {
-  bot.sendMessage(CHAT_ID, messaggio, "");
 }
 
 void registraVideo(int durata) {
@@ -198,7 +196,7 @@ void registraVideo(int durata) {
       writejpg(SD_MMC, path, fb->buf, fb->len);
       esp_camera_fb_return(fb);
     }
-    delay(200);
+    delay(150);
   }
   uploadVideo(clipPrefix);
 }
@@ -206,7 +204,6 @@ void registraVideo(int durata) {
 void uploadVideo(String clipPath) {
   File root = SD_MMC.open(clipPath.c_str());
   if (!root) return;
-  
   File file = root.openNextFile();
   while (file) {
     if (!file.isDirectory()) {
