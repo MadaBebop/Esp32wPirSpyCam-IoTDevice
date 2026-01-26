@@ -1,1 +1,1 @@
-# Sistema di Videosorveglianza IoT con ESP32-CAM (PIR-Attivato)
+# Sistema di Videosorveglianza IoT con ESP32-CAM e PIR
