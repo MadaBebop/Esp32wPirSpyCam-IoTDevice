@@ -28,7 +28,7 @@ const int LED_PIN = 2;
 
 // Gestione Tempi
 unsigned long lastTrigger = 0;          
-const unsigned long pirCooldown = 50000; 
+const unsigned long pirCooldown = 5000; 
 unsigned long lastTimeBotRan = 0;       
 int botRequestDelay = 500; 
 
